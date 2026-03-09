@@ -115,6 +115,7 @@ ML_CONFIDENCE_RANGE = 0.63  # seuil ML plus strict en régime RANGE
 
 # Scoring global
 MIN_SCORE = 5  # score minimum sur 10 pour trader
+DEGRADED_MODE = False  # set True after pre-training if no ML models validated
 
 # Circuit breaker
 MAX_CONSECUTIVE_LOSSES = 3
@@ -215,6 +216,9 @@ def load_open_trades() -> dict:
         return data
     except FileNotFoundError:
         return {}
+    except json.JSONDecodeError:
+        logger.warning(f"⚠️ {TRADES_FILE} corrompu — réinitialisation à vide")
+        return {}
 
 
 # ============================================================
@@ -234,6 +238,9 @@ def load_equity_curve() -> list:
         logger.info(f"📂 Equity curve rechargée : {len(data)} points")
         return data
     except FileNotFoundError:
+        return []
+    except json.JSONDecodeError:
+        logger.warning(f"⚠️ {EQUITY_CURVE_FILE} corrompu — réinitialisation à vide")
         return []
 
 
@@ -1164,7 +1171,9 @@ def full_analyse_pro(symbol: str):
 
     # ── Prédiction ML (données 1h) ─────────────────────────
     data_1h = get_bars_cached(symbol, TimeFrame.Hour, 90)
-    if len(data_1h) < 80:
+    # Fix 3: Only enforce the 80-bar minimum when a model actually exists for this symbol.
+    # If no model exists, we proceed without ML (ml_prob stays None).
+    if symbol in ml_models and len(data_1h) < 80:
         return None
 
     ml_prob = predict_ml(symbol, data_1h)
@@ -1212,7 +1221,8 @@ def full_analyse_pro(symbol: str):
         f"ML:{score_ml} Regime:{score_regime} | TOTAL:{total_score}/10"
     )
 
-    if total_score < MIN_SCORE:
+    effective_min_score = MIN_SCORE - 1 if DEGRADED_MODE else MIN_SCORE
+    if total_score < effective_min_score:
         logger.info(f"⚠️ {symbol} score insuffisant ({total_score}/{MIN_SCORE}) → skip")
         return None
 
@@ -1221,7 +1231,8 @@ def full_analyse_pro(symbol: str):
         f"✅ {symbol} {sig} | Score:{total_score}/10 | TF:{tf_confirmations}/3 | "
         f"VWAP:{vwap_confirmations}/3 | ML:{ml_prob_str} | Regime:{regime}"
     )
-    return sig, tf_1h['rsi'], tf_5m['price'], total_score, ml_prob
+    # Fix 1: Return 0.5 (neutral) instead of None so downstream sort tuples don't crash
+    return sig, tf_1h['rsi'], tf_5m['price'], total_score, ml_prob if ml_prob is not None else 0.5
 
 
 # ============================================================
@@ -1498,6 +1509,7 @@ for sym in startup_watchlist:
     time.sleep(0.5)
 
 if len(ml_models) == 0:
+    DEGRADED_MODE = True
     logger.warning(
         "⚠️ AUCUN modèle ML validé au démarrage — le bot fonctionnera en MODE DÉGRADÉ "
         "(sans filtre ML, score réduit). Vérifiez la connexion et les données de marché."
@@ -1509,6 +1521,7 @@ if len(ml_models) == 0:
         "mais sans le filtre ML. Les modèles seront réessayés à la demande."
     )
 else:
+    DEGRADED_MODE = False
     logger.info(f"✅ Modèles prêts : {len(ml_models)}/{len(startup_watchlist)} validés\n")
 
 # 3. Alerte Telegram de confirmation
@@ -1526,18 +1539,27 @@ send_telegram(
 # ============================================================
 logger.info(f"🚀 DÉMARRAGE {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 logger.info("=" * 60)
-trades_count      = 0
-last_scan_report  = 0   # timestamp dernier résumé scan Telegram
+trades_count         = 0
+last_scan_report     = 0   # timestamp dernier résumé scan Telegram
+_report_saved_today  = False  # Fix 6: prevent duplicate session reports each evening
+_report_saved_date   = None   # date for which the report was already saved
 
 try:
     while True:
-        now_str = datetime.now().strftime('%H:%M:%S')
+        now_str  = datetime.now().strftime('%H:%M:%S')
+        today    = datetime.now(NYSE_TZ).date()
+
+        # Reset daily flag at market open so a new report can be saved tonight
+        if _report_saved_date != today:
+            _report_saved_today = False
+            _report_saved_date  = today
 
         if not is_market_open():
             wait_sec = seconds_until_open()
             logger.info(f"🕐 [{now_str}] Marché fermé — {wait_sec//60} min avant ouverture")
-            if datetime.now(NYSE_TZ).hour >= 16:
+            if datetime.now(NYSE_TZ).hour >= 16 and not _report_saved_today:
                 save_session_report()
+                _report_saved_today = True
             time.sleep(min(wait_sec, 300))
             continue
 
@@ -1634,6 +1656,9 @@ try:
                 # Recalcule stop/TP avec le vrai prix de fill
                 stop_p, tp_p, atr_val = calc_atr_levels(sym, real_entry, sig)
                 half_qty   = qty // 2
+                # Fix 4: qty=1 edge case — half_qty would be 0, which causes an API error
+                if half_qty < 1:
+                    half_qty = qty
                 trail_dollar = round(TRAIL_ATR_MULT * atr_val, 2)
 
                 # ── Soumettre stop, TP et trailing stop ──────────
