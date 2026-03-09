@@ -1458,28 +1458,33 @@ def save_session_report():
 
 
 # ============================================================
-# PRÉ-ENTRAÎNEMENT ML AU DÉMARRAGE (watchlist complète)
+# PRÉ-ENTRAÎNEMENT ML AU DÉMARRAGE (watchlist dynamique complète)
 # ============================================================
-logger.info("\n📊 Scan Finviz initial...")
+# 1. D'abord, scan Finviz pour construire la watchlist complète
+logger.info("\n📊 Scan Finviz initial pour construire la watchlist dynamique...")
 startup_watchlist = get_combined_watchlist()
 logger.info(f"📋 Watchlist complète au démarrage : {len(startup_watchlist)} symboles")
-logger.info(f"   Statique : {WATCHLIST}")
+logger.info(f"   Statique ({len(WATCHLIST)}) : {WATCHLIST}")
 finviz_extras = [s for s in startup_watchlist if s not in WATCHLIST]
 if finviz_extras:
-    logger.info(f"   Finviz   : {finviz_extras}")
+    logger.info(f"   Finviz   (+{len(finviz_extras)}) : {finviz_extras}")
+else:
+    logger.info("   Finviz   : aucun symbole supplémentaire (Finviz indisponible ou pas de résultat)")
 
-logger.info("\n🔧 Pré-entraînement des modèles ML sur tous les symboles...")
+# 2. Pré-entraîner les modèles ML sur TOUS les symboles
+logger.info(f"\n🔧 Pré-entraînement ML sur {len(startup_watchlist)} symboles...")
 for sym in startup_watchlist:
     train_model(sym)
     time.sleep(0.5)
 logger.info(f"✅ Modèles prêts : {len(ml_models)}/{len(startup_watchlist)} validés\n")
 
+# 3. Alerte Telegram de confirmation
 send_telegram(
     f"🔧 <b>PRÉ-ENTRAÎNEMENT TERMINÉ</b>\n"
     f"Symboles analysés : {len(startup_watchlist)}\n"
     f"Modèles validés : {len(ml_models)}/{len(startup_watchlist)}\n"
     f"Watchlist statique : {len(WATCHLIST)} | Finviz : +{len(finviz_extras)}\n"
-    f"Prêt à trader ! ✅"
+    f"{'✅ Prêt à trader !' if len(ml_models) > 0 else '⚠️ Aucun modèle validé'}"
 )
 
 
