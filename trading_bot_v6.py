@@ -45,6 +45,7 @@ import logging
 import warnings
 from datetime import datetime, timedelta
 from functools import wraps
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -578,7 +579,7 @@ def train_model(symbol: str) -> bool:
     try:
         logger.info(f"🔧 Entraînement ML {symbol}...")
         data = get_bars(symbol, TimeFrame.Hour, 90)
-        if len(data) < 200:
+        if len(data) < 80:
             logger.warning(f"{symbol} : données insuffisantes ({len(data)} bougies)")
             return False
 
@@ -588,7 +589,8 @@ def train_model(symbol: str) -> bool:
         X        = features.loc[common].iloc[:-1]
         y        = target.loc[common].iloc[:-1]
 
-        if len(X) < 100:
+        if len(X) < 50:
+            logger.warning(f"{symbol} : X trop petit ({len(X)} samples après features)")
             return False
 
         scaler   = StandardScaler()
@@ -856,7 +858,7 @@ _macro_cache: dict = {'last_update': 0, 'data': None}
 MACRO_REFRESH_SECONDS = 1800  # 30 minutes
 
 
-def get_fred_data(series_id: str) -> float | None:
+def get_fred_data(series_id: str) -> Optional[float]:
     """Appelle l'API FRED directement pour récupérer la dernière valeur d'une série."""
     if not FRED_API_KEY:
         return None
@@ -879,7 +881,7 @@ def get_fred_data(series_id: str) -> float | None:
     return None
 
 
-def get_fear_greed_index() -> float | None:
+def get_fear_greed_index() -> Optional[float]:
     """Récupère le Fear & Greed Index depuis alternative.me (gratuit)."""
     try:
         resp = requests.get("https://api.alternative.me/fng/", timeout=10)
@@ -891,7 +893,7 @@ def get_fear_greed_index() -> float | None:
     return None
 
 
-def get_btc_change_24h() -> float | None:
+def get_btc_change_24h() -> Optional[float]:
     """Récupère la variation BTC sur 24h via CoinGecko (gratuit)."""
     try:
         resp = requests.get(
@@ -998,7 +1000,7 @@ def finviz_scan() -> list:
 
         # ── Critères LONG ──────────────────────────────────────
         long_filters = {
-            'Exchange':             'NASD,NYSE',
+            'Exchange':             'NASDAQ',
             'Market Cap.':          '+Mid (over $2bln)',
             'Average Volume':       'Over 500K',
             'Relative Volume':      'Over 1',
@@ -1018,12 +1020,12 @@ def finviz_scan() -> list:
 
         # ── Critères SHORT ─────────────────────────────────────
         short_filters = {
-            'Exchange':             'NASD,NYSE',
+            'Exchange':             'NASDAQ',
             'Market Cap.':          '+Mid (over $2bln)',
             'Average Volume':       'Over 500K',
             'Relative Volume':      'Over 1',
             '20-Day Simple Moving Average': 'Price below SMA20',
-            'Performance (Week)':   'Down',
+            'Performance':          'Down',
         }
         try:
             fov_short = Overview()
@@ -1152,7 +1154,7 @@ def full_analyse_pro(symbol: str):
 
     # ── Prédiction ML (données 1h) ─────────────────────────
     data_1h = get_bars_cached(symbol, TimeFrame.Hour, 90)
-    if len(data_1h) < 100:
+    if len(data_1h) < 80:
         return None
 
     ml_prob = predict_ml(symbol, data_1h)
