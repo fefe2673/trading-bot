@@ -45,6 +45,7 @@ import logging
 import warnings
 from datetime import datetime, timedelta
 from functools import wraps
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -856,7 +857,7 @@ _macro_cache: dict = {'last_update': 0, 'data': None}
 MACRO_REFRESH_SECONDS = 1800  # 30 minutes
 
 
-def get_fred_data(series_id: str) -> float | None:
+def get_fred_data(series_id: str) -> Optional[float]:
     """Appelle l'API FRED directement pour récupérer la dernière valeur d'une série."""
     if not FRED_API_KEY:
         return None
@@ -879,7 +880,7 @@ def get_fred_data(series_id: str) -> float | None:
     return None
 
 
-def get_fear_greed_index() -> float | None:
+def get_fear_greed_index() -> Optional[float]:
     """Récupère le Fear & Greed Index depuis alternative.me (gratuit)."""
     try:
         resp = requests.get("https://api.alternative.me/fng/", timeout=10)
@@ -891,7 +892,7 @@ def get_fear_greed_index() -> float | None:
     return None
 
 
-def get_btc_change_24h() -> float | None:
+def get_btc_change_24h() -> Optional[float]:
     """Récupère la variation BTC sur 24h via CoinGecko (gratuit)."""
     try:
         resp = requests.get(
