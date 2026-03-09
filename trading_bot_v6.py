@@ -110,7 +110,7 @@ TRAIL_ATR_MULT   = 1.0
 # P1 — Seuils assouplis
 ML_CONFIDENCE    = 0.58   # was 0.62
 ML_RETRAIN_HOURS = 2
-MIN_CV_SCORE     = 0.52   # was 0.54
+MIN_CV_SCORE     = 0.50   # was 0.52
 ML_CONFIDENCE_RANGE = 0.63  # seuil ML plus strict en régime RANGE
 
 # Scoring global
@@ -281,16 +281,25 @@ def get_bars(symbol: str, timeframe, days: int) -> pd.DataFrame:
         end   = datetime.now(pytz.UTC)
         # Ajoute des jours supplémentaires pour compenser les week-ends
         start = end - timedelta(days=days + 10)
-        request = StockBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            limit=10000,
-            adjustment='raw', feed='iex'
-        )
-        bars = client_data.get_stock_bars(request)
-        if bars.df.empty:
+        bars = None
+        for feed in ('sip', 'iex'):
+            try:
+                request = StockBarsRequest(
+                    symbol_or_symbols=[symbol],
+                    timeframe=timeframe,
+                    start=start,
+                    end=end,
+                    limit=10000,
+                    adjustment='raw', feed=feed
+                )
+                result = client_data.get_stock_bars(request)
+                if not result.df.empty:
+                    bars = result
+                    break
+            except Exception as feed_err:
+                logger.debug(f"get_bars {symbol} feed={feed} : {feed_err}")
+                continue
+        if bars is None:
             return pd.DataFrame()
 
         df = bars.df
@@ -589,7 +598,7 @@ def train_model(symbol: str) -> bool:
         X        = features.loc[common].iloc[:-1]
         y        = target.loc[common].iloc[:-1]
 
-        if len(X) < 50:
+        if len(X) < 40:
             logger.warning(f"{symbol} : X trop petit ({len(X)} samples après features)")
             return False
 
@@ -602,7 +611,8 @@ def train_model(symbol: str) -> bool:
         )
 
         # P0-3 : TimeSeriesSplit pour éviter le data leakage temporel
-        tscv      = TimeSeriesSplit(n_splits=3)
+        n_splits  = 2 if len(X) < 100 else 3
+        tscv      = TimeSeriesSplit(n_splits=n_splits)
         cv_scores = cross_val_score(model, X_scaled, y, cv=tscv, scoring='accuracy')
         cv_mean   = cv_scores.mean()
         logger.info(f"🤖 {symbol} CV (TimeSeriesSplit) : {cv_mean:.2%} (min : {MIN_CV_SCORE:.0%})")
@@ -627,7 +637,7 @@ def train_model(symbol: str) -> bool:
         return False
 
 
-def predict_ml(symbol: str, data_1h: pd.DataFrame) -> float:
+def predict_ml(symbol: str, data_1h: pd.DataFrame) -> Optional[float]:
     if symbol in ml_models:
         age_h = (datetime.now() - ml_models[symbol]['trained_at']).total_seconds() / 3600
         if age_h > ML_RETRAIN_HOURS:
@@ -637,19 +647,19 @@ def predict_ml(symbol: str, data_1h: pd.DataFrame) -> float:
         train_model(symbol)
 
     if symbol not in ml_models:
-        return 0.5
+        return None
 
     try:
         entry    = ml_models[symbol]
         features = build_features(data_1h)
         if len(features) == 0:
-            return 0.5
+            return None
         X_last   = features.iloc[-1:][entry['features']]
         X_scaled = entry['scaler'].transform(X_last)
         return float(entry['model'].predict_proba(X_scaled)[0][1])
     except Exception as e:
         logger.warning(f"Predict {symbol} : {e}")
-        return 0.5
+        return None
 
 
 # ============================================================
@@ -1161,12 +1171,18 @@ def full_analyse_pro(symbol: str):
 
     # Seuil ML : standard ou strict si RANGE
     ml_threshold = ML_CONFIDENCE_RANGE if regime == "RANGE" else ML_CONFIDENCE
-    if is_long  and ml_prob < ml_threshold:
-        logger.info(f"🤖 ML {symbol} : {ml_prob:.0%} < seuil LONG {ml_threshold:.0%} → skip")
-        return None
-    if is_short and ml_prob > (1.0 - ml_threshold):
-        logger.info(f"🤖 ML {symbol} : {ml_prob:.0%} > seuil SHORT {1.0-ml_threshold:.0%} → skip")
-        return None
+    if ml_prob is None:
+        # Aucun modèle ML disponible — mode dégradé, on continue sans filtre ML
+        logger.warning(f"⚠️ ML non disponible pour {symbol}, analyse sans ML")
+        score_ml = 0
+    else:
+        if is_long  and ml_prob < ml_threshold:
+            logger.info(f"🤖 ML {symbol} : {ml_prob:.0%} < seuil LONG {ml_threshold:.0%} → skip")
+            return None
+        if is_short and ml_prob > (1.0 - ml_threshold):
+            logger.info(f"🤖 ML {symbol} : {ml_prob:.0%} > seuil SHORT {1.0-ml_threshold:.0%} → skip")
+            return None
+        score_ml = 1 if (is_long and ml_prob >= ml_threshold) or (is_short and ml_prob <= 1.0 - ml_threshold) else 0
 
     # ── SCORING GLOBAL ─────────────────────────────────────
     # TF confirmations : 0-3
@@ -1181,9 +1197,6 @@ def full_analyse_pro(symbol: str):
     # Gap bonus : +1 si gap_score >= 2 et direction alignée
     gap_aligned = (gap_direction == 'UP' and is_long) or (gap_direction == 'DOWN' and is_short)
     score_gap = 1 if (gap_score >= 2 and gap_aligned) else 0
-
-    # ML bonus : +1 si prob atteint le seuil
-    score_ml = 1 if (is_long and ml_prob >= ml_threshold) or (is_short and ml_prob <= 1.0 - ml_threshold) else 0
 
     # Régime bonus : +1 si TREND aligné
     score_regime = 1 if (
@@ -1203,9 +1216,10 @@ def full_analyse_pro(symbol: str):
         logger.info(f"⚠️ {symbol} score insuffisant ({total_score}/{MIN_SCORE}) → skip")
         return None
 
+    ml_prob_str = f"{ml_prob:.0%}" if ml_prob is not None else "N/A"
     logger.info(
         f"✅ {symbol} {sig} | Score:{total_score}/10 | TF:{tf_confirmations}/3 | "
-        f"VWAP:{vwap_confirmations}/3 | ML:{ml_prob:.0%} | Regime:{regime}"
+        f"VWAP:{vwap_confirmations}/3 | ML:{ml_prob_str} | Regime:{regime}"
     )
     return sig, tf_1h['rsi'], tf_5m['price'], total_score, ml_prob
 
@@ -1476,9 +1490,26 @@ else:
 # 2. Pré-entraîner les modèles ML sur TOUS les symboles
 logger.info(f"\n🔧 Pré-entraînement ML sur {len(startup_watchlist)} symboles...")
 for sym in startup_watchlist:
-    train_model(sym)
+    if not train_model(sym):
+        # Retry une fois après 2s en cas d'échec (rate limit ou erreur transitoire)
+        time.sleep(2)
+        if not train_model(sym):
+            logger.debug(f"⚠️ {sym} : modèle non validé après retry")
     time.sleep(0.5)
-logger.info(f"✅ Modèles prêts : {len(ml_models)}/{len(startup_watchlist)} validés\n")
+
+if len(ml_models) == 0:
+    logger.warning(
+        "⚠️ AUCUN modèle ML validé au démarrage — le bot fonctionnera en MODE DÉGRADÉ "
+        "(sans filtre ML, score réduit). Vérifiez la connexion et les données de marché."
+    )
+    send_telegram(
+        "⚠️ <b>MODE DÉGRADÉ</b> — Aucun modèle ML validé au démarrage.\n"
+        f"Symboles analysés : {len(startup_watchlist)}\n"
+        "Le bot continuera à trader avec les critères techniques (multi-TF, VWAP, news, gap) "
+        "mais sans le filtre ML. Les modèles seront réessayés à la demande."
+    )
+else:
+    logger.info(f"✅ Modèles prêts : {len(ml_models)}/{len(startup_watchlist)} validés\n")
 
 # 3. Alerte Telegram de confirmation
 send_telegram(
@@ -1486,7 +1517,7 @@ send_telegram(
     f"Symboles analysés : {len(startup_watchlist)}\n"
     f"Modèles validés : {len(ml_models)}/{len(startup_watchlist)}\n"
     f"Watchlist statique : {len(WATCHLIST)} | Finviz : +{len(finviz_extras)}\n"
-    f"{'✅ Prêt à trader !' if len(ml_models) > 0 else '⚠️ Aucun modèle validé'}"
+    f"{'✅ Prêt à trader !' if len(ml_models) > 0 else '⚠️ Mode dégradé — 0 modèles validés'}"
 )
 
 
@@ -1638,7 +1669,7 @@ try:
                 logger.info(
                     f"✅ {sig} {qty}x {sym} @{real_entry:.2f} | "
                     f"ATR:{atr_val:.2f} | Stop:{stop_p:.2f} | TP:{tp_p:.2f} | "
-                    f"ML:{ml_prob:.0%} | Score:{score}/10"
+                    f"ML:{f'{ml_prob:.0%}' if ml_prob is not None else 'N/A'} | Score:{score}/10"
                 )
                 trades_count += 1
 
@@ -1648,7 +1679,7 @@ try:
                     f"Symbole : <b>{sym}</b> | Side : {sig}\n"
                     f"Qty : {qty} @ ${real_entry:.2f}\n"
                     f"Stop : ${stop_p:.2f} | TP : ${tp_p:.2f}\n"
-                    f"ML score : {ml_prob:.0%} | Score total : {score}/10"
+                    f"ML score : {f'{ml_prob:.0%}' if ml_prob is not None else 'N/A'} | Score total : {score}/10"
                 )
 
             except Exception as e:
