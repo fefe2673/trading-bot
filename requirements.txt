@@ -5,3 +5,4 @@ pandas>=2.0.0
 TA-Lib>=0.4.25
 scikit-learn>=1.3.0
 pytz>=2023.3
+finvizfinance>=0.14
