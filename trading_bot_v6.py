@@ -1458,13 +1458,29 @@ def save_session_report():
 
 
 # ============================================================
-# PRÉ-ENTRAÎNEMENT ML AU DÉMARRAGE
+# PRÉ-ENTRAÎNEMENT ML AU DÉMARRAGE (watchlist complète)
 # ============================================================
-logger.info("\n🔧 Pré-entraînement des modèles ML...")
-for sym in WATCHLIST:
+logger.info("\n📊 Scan Finviz initial...")
+startup_watchlist = get_combined_watchlist()
+logger.info(f"📋 Watchlist complète au démarrage : {len(startup_watchlist)} symboles")
+logger.info(f"   Statique : {WATCHLIST}")
+finviz_extras = [s for s in startup_watchlist if s not in WATCHLIST]
+if finviz_extras:
+    logger.info(f"   Finviz   : {finviz_extras}")
+
+logger.info("\n🔧 Pré-entraînement des modèles ML sur tous les symboles...")
+for sym in startup_watchlist:
     train_model(sym)
     time.sleep(0.5)
-logger.info(f"✅ Modèles prêts : {len(ml_models)}/{len(WATCHLIST)} validés\n")
+logger.info(f"✅ Modèles prêts : {len(ml_models)}/{len(startup_watchlist)} validés\n")
+
+send_telegram(
+    f"🔧 <b>PRÉ-ENTRAÎNEMENT TERMINÉ</b>\n"
+    f"Symboles analysés : {len(startup_watchlist)}\n"
+    f"Modèles validés : {len(ml_models)}/{len(startup_watchlist)}\n"
+    f"Watchlist statique : {len(WATCHLIST)} | Finviz : +{len(finviz_extras)}\n"
+    f"Prêt à trader ! ✅"
+)
 
 
 # ============================================================
