@@ -12,7 +12,8 @@ CHANGEMENTS v6 :
     - Système de scoring global (score >= 5/10) au lieu de filtres binaires
     - Gap optionnel (bonus, plus bloquant)
     - Régime RANGE accepté (ML + strict)
-    - ML seuil baissé à 58%, CV min à 52%
+    - ML transformé en bonus graduel (0/1/2 pts), jamais bloquant
+    - Target ML horizon 5h (pct_change(5)) au lieu de 1h — plus prédictible
     - VWAP assoupli à >= 1/3
 
   P2 — FINVIZ SCREENING :
@@ -114,8 +115,8 @@ MIN_CV_SCORE     = 0.50   # was 0.52
 ML_CONFIDENCE_RANGE = 0.63  # seuil ML plus strict en régime RANGE
 
 # Scoring global
-MIN_SCORE = 5  # score minimum sur 10 pour trader
-DEGRADED_MODE = False  # set True after pre-training if no ML models validated
+MIN_SCORE = 5  # score minimum sur 11 pour trader
+# Note: DEGRADED_MODE supprimé — le ML est maintenant un bonus, pas un bloqueur
 
 # Circuit breaker
 MAX_CONSECUTIVE_LOSSES = 3
@@ -600,10 +601,10 @@ def train_model(symbol: str) -> bool:
             return False
 
         features = build_features(data)
-        target   = (data['close'].pct_change().shift(-1) > 0).astype(int)
+        target   = (data['close'].pct_change(5).shift(-5) > 0).astype(int)
         common   = features.index.intersection(target.index)
-        X        = features.loc[common].iloc[:-1]
-        y        = target.loc[common].iloc[:-1]
+        X        = features.loc[common].iloc[:-5]
+        y        = target.loc[common].iloc[:-5]
 
         if len(X) < 40:
             logger.warning(f"{symbol} : X trop petit ({len(X)} samples après features)")
@@ -1092,8 +1093,9 @@ def full_analyse_pro(symbol: str):
 
     Score total = TF_confirmations (0-3) + VWAP_confirmations (0-3)
                 + news_bonus (0-1) + gap_bonus (0-1)
-                + ml_bonus (0-1) + regime_bonus (0-1)
-    Maximum : 10 points. Seuil : >= 5 pour trader.
+                + ml_bonus (0-2) + regime_bonus (0-1)
+    Maximum : 11 points. Seuil : >= 5 pour trader.
+    Le ML est un BONUS graduel (0/1/2), jamais un bloqueur.
 
     LONG  : EMA9 > EMA20 > EMA50, RSI > 50, MACD haussier, prix > VWAP
     SHORT : EMA9 < EMA20 < EMA50, RSI < 50, MACD baissier, prix < VWAP
@@ -1181,17 +1183,26 @@ def full_analyse_pro(symbol: str):
     # Seuil ML : standard ou strict si RANGE
     ml_threshold = ML_CONFIDENCE_RANGE if regime == "RANGE" else ML_CONFIDENCE
     if ml_prob is None:
-        # Aucun modèle ML disponible — mode dégradé, on continue sans filtre ML
-        logger.warning(f"⚠️ ML non disponible pour {symbol}, analyse sans ML")
+        # Aucun modèle ML disponible — on continue sans filtre ML
+        logger.info(f"🤖 ML {symbol} : non disponible → score_ml=0")
         score_ml = 0
     else:
-        if is_long  and ml_prob < ml_threshold:
-            logger.info(f"🤖 ML {symbol} : {ml_prob:.0%} < seuil LONG {ml_threshold:.0%} → skip")
-            return None
-        if is_short and ml_prob > (1.0 - ml_threshold):
-            logger.info(f"🤖 ML {symbol} : {ml_prob:.0%} > seuil SHORT {1.0-ml_threshold:.0%} → skip")
-            return None
-        score_ml = 1 if (is_long and ml_prob >= ml_threshold) or (is_short and ml_prob <= 1.0 - ml_threshold) else 0
+        # Scoring graduel : le ML ne bloque jamais, il ajoute 0, 1 ou 2 points
+        if is_long:
+            if ml_prob >= ml_threshold:
+                score_ml = 2      # ML très confiant → +2
+            elif ml_prob >= 0.55:
+                score_ml = 1      # ML légèrement positif → +1
+            else:
+                score_ml = 0      # ML pas convaincu → pas de bonus
+        else:  # is_short
+            if ml_prob <= (1.0 - ml_threshold):
+                score_ml = 2
+            elif ml_prob <= 0.45:
+                score_ml = 1
+            else:
+                score_ml = 0
+        logger.info(f"🤖 ML {symbol} : {ml_prob:.0%} → score_ml={score_ml}")
 
     # ── SCORING GLOBAL ─────────────────────────────────────
     # TF confirmations : 0-3
@@ -1218,17 +1229,16 @@ def full_analyse_pro(symbol: str):
     logger.info(
         f"🎯 SCORING {symbol} {sig} | "
         f"TF:{score_tf}/3 VWAP:{score_vwap}/3 News:{score_news} Gap:{score_gap} "
-        f"ML:{score_ml} Regime:{score_regime} | TOTAL:{total_score}/10"
+        f"ML:{score_ml}/2 Regime:{score_regime} | TOTAL:{total_score}/11"
     )
 
-    effective_min_score = MIN_SCORE - 1 if DEGRADED_MODE else MIN_SCORE
-    if total_score < effective_min_score:
+    if total_score < MIN_SCORE:
         logger.info(f"⚠️ {symbol} score insuffisant ({total_score}/{MIN_SCORE}) → skip")
         return None
 
     ml_prob_str = f"{ml_prob:.0%}" if ml_prob is not None else "N/A"
     logger.info(
-        f"✅ {symbol} {sig} | Score:{total_score}/10 | TF:{tf_confirmations}/3 | "
+        f"✅ {symbol} {sig} | Score:{total_score}/11 | TF:{tf_confirmations}/3 | "
         f"VWAP:{vwap_confirmations}/3 | ML:{ml_prob_str} | Regime:{regime}"
     )
     # Fix 1: Return 0.5 (neutral) instead of None so downstream sort tuples don't crash
@@ -1508,21 +1518,13 @@ for sym in startup_watchlist:
             logger.debug(f"⚠️ {sym} : modèle non validé après retry")
     time.sleep(0.5)
 
+logger.info(f"✅ Modèles prêts : {len(ml_models)}/{len(startup_watchlist)} validés")
 if len(ml_models) == 0:
-    DEGRADED_MODE = True
     logger.warning(
-        "⚠️ AUCUN modèle ML validé au démarrage — le bot fonctionnera en MODE DÉGRADÉ "
-        "(sans filtre ML, score réduit). Vérifiez la connexion et les données de marché."
+        "⚠️ Aucun modèle ML validé au démarrage — le bot continuera normalement. "
+        "Le ML est un bonus au scoring (0-2 pts), pas un bloqueur. "
+        "Les modèles seront réessayés à la demande."
     )
-    send_telegram(
-        "⚠️ <b>MODE DÉGRADÉ</b> — Aucun modèle ML validé au démarrage.\n"
-        f"Symboles analysés : {len(startup_watchlist)}\n"
-        "Le bot continuera à trader avec les critères techniques (multi-TF, VWAP, news, gap) "
-        "mais sans le filtre ML. Les modèles seront réessayés à la demande."
-    )
-else:
-    DEGRADED_MODE = False
-    logger.info(f"✅ Modèles prêts : {len(ml_models)}/{len(startup_watchlist)} validés\n")
 
 # 3. Alerte Telegram de confirmation
 send_telegram(
@@ -1530,7 +1532,7 @@ send_telegram(
     f"Symboles analysés : {len(startup_watchlist)}\n"
     f"Modèles validés : {len(ml_models)}/{len(startup_watchlist)}\n"
     f"Watchlist statique : {len(WATCHLIST)} | Finviz : +{len(finviz_extras)}\n"
-    f"{'✅ Prêt à trader !' if len(ml_models) > 0 else '⚠️ Mode dégradé — 0 modèles validés'}"
+    f"✅ Prêt à trader ! (ML = bonus, pas bloqueur)"
 )
 
 
@@ -1694,7 +1696,7 @@ try:
                 logger.info(
                     f"✅ {sig} {qty}x {sym} @{real_entry:.2f} | "
                     f"ATR:{atr_val:.2f} | Stop:{stop_p:.2f} | TP:{tp_p:.2f} | "
-                    f"ML:{f'{ml_prob:.0%}' if ml_prob is not None else 'N/A'} | Score:{score}/10"
+                    f"ML:{f'{ml_prob:.0%}' if ml_prob is not None else 'N/A'} | Score:{score}/11"
                 )
                 trades_count += 1
 
@@ -1704,7 +1706,7 @@ try:
                     f"Symbole : <b>{sym}</b> | Side : {sig}\n"
                     f"Qty : {qty} @ ${real_entry:.2f}\n"
                     f"Stop : ${stop_p:.2f} | TP : ${tp_p:.2f}\n"
-                    f"ML score : {f'{ml_prob:.0%}' if ml_prob is not None else 'N/A'} | Score total : {score}/10"
+                    f"ML score : {f'{ml_prob:.0%}' if ml_prob is not None else 'N/A'} | Score total : {score}/11"
                 )
 
             except Exception as e:
