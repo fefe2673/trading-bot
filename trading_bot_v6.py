@@ -1274,14 +1274,19 @@ def sync_open_trades():
             if filled_order is None:
                 continue
             exit_price = float(filled_order.filled_avg_price or trade[exit_side])
-            half_qty     = trade['qty'] // 2
+            # Use stored per-order quantities; fall back to third of total for legacy records
+            if tp_filled:
+                filled_qty = trade.get('tp_qty') or trade['qty'] // 3
+            else:
+                filled_qty = trade.get('stop_qty') or trade['qty'] // 3
 
-            pnl_half = (exit_price - trade['entry']) * half_qty if trade['side'] == 'BUY' \
-                       else (trade['entry'] - exit_price) * half_qty
+            pnl_half = (exit_price - trade['entry']) * filled_qty if trade['side'] == 'BUY' \
+                       else (trade['entry'] - exit_price) * filled_qty
 
             try:
                 other_id = trade['stop_id'] if tp_filled else trade['tp_id']
-                client_trade.cancel_order_by_id(other_id)
+                if other_id:
+                    client_trade.cancel_order_by_id(other_id)
             except Exception:
                 pass
 
@@ -1291,7 +1296,7 @@ def sync_open_trades():
                 except Exception:
                     pass
 
-            remaining_qty = trade['qty'] - half_qty
+            remaining_qty = trade['qty'] - filled_qty
             pnl_remaining = 0.0
             if remaining_qty > 0:
                 close_side  = OrderSide.SELL if trade['side'] == 'BUY' else OrderSide.BUY
@@ -1657,27 +1662,45 @@ try:
 
                 # Recalcule stop/TP avec le vrai prix de fill
                 stop_p, tp_p, atr_val = calc_atr_levels(sym, real_entry, sig)
-                half_qty   = qty // 2
-                # Fix 4: qty=1 edge case — half_qty would be 0, which causes an API error
-                if half_qty < 1:
-                    half_qty = qty
                 trail_dollar = round(TRAIL_ATR_MULT * atr_val, 2)
+
+                # Split position into 3 parts that sum exactly to qty so that
+                # stop_qty + tp_qty + trail_qty == qty (prevents "insufficient qty" errors).
+                # Edge case: qty < 3 → single stop-loss for the full position;
+                # tp_qty and trail_qty are 0 so the conditional checks below skip
+                # those orders and tp_id/trail_id are stored as None.
+                if qty < 3:
+                    stop_qty  = qty
+                    tp_qty    = 0
+                    trail_qty = 0
+                else:
+                    third     = qty // 3
+                    stop_qty  = third
+                    tp_qty    = third
+                    trail_qty = qty - 2 * third  # absorbs remainder to keep total == qty
 
                 # ── Soumettre stop, TP et trailing stop ──────────
                 # P0-4 : Si stop/TP échoue, fermeture immédiate de la position
                 try:
                     stop_order = client_trade.submit_order(
-                        StopOrderRequest(symbol=sym, qty=half_qty, side=close_side,
+                        StopOrderRequest(symbol=sym, qty=stop_qty, side=close_side,
                                          stop_price=stop_p, time_in_force=TimeInForce.GTC)
                     )
-                    tp_order = client_trade.submit_order(
-                        LimitOrderRequest(symbol=sym, qty=half_qty, side=close_side,
-                                          limit_price=tp_p, time_in_force=TimeInForce.GTC)
-                    )
-                    trail_order = client_trade.submit_order(
-                        TrailingStopOrderRequest(symbol=sym, qty=half_qty, side=close_side,
-                                                 trail_price=trail_dollar, time_in_force=TimeInForce.GTC)
-                    )
+                    # tp_qty/trail_qty are 0 for qty < 3; skip to avoid zero-qty orders
+                    if tp_qty > 0:
+                        tp_order = client_trade.submit_order(
+                            LimitOrderRequest(symbol=sym, qty=tp_qty, side=close_side,
+                                              limit_price=tp_p, time_in_force=TimeInForce.GTC)
+                        )
+                    else:
+                        tp_order = None
+                    if trail_qty > 0:
+                        trail_order = client_trade.submit_order(
+                            TrailingStopOrderRequest(symbol=sym, qty=trail_qty, side=close_side,
+                                                     trail_price=trail_dollar, time_in_force=TimeInForce.GTC)
+                        )
+                    else:
+                        trail_order = None
                 except Exception as e:
                     logger.error(f"🚨 Protection échouée pour {sym}, fermeture immédiate : {e}")
                     client_trade.submit_order(
@@ -1685,11 +1708,16 @@ try:
                     )
                     continue
 
+                # tp_id and trail_id may be None for small positions (qty < 3);
+                # sync_open_trades() guards against cancelling None ids.
                 open_trades[sym] = {
                     'entry':    real_entry, 'qty': qty, 'side': sig,
                     'stop':     stop_p,     'tp':  tp_p, 'atr': atr_val, 'ml_prob': ml_prob,
-                    'stop_id':  str(stop_order.id),  'tp_id':    str(tp_order.id),
-                    'trail_id': str(trail_order.id), 'open_time': datetime.now(),
+                    'stop_id':  str(stop_order.id),
+                    'tp_id':    str(tp_order.id) if tp_order else None,
+                    'trail_id': str(trail_order.id) if trail_order else None,
+                    'stop_qty': stop_qty, 'tp_qty': tp_qty, 'trail_qty': trail_qty,
+                    'open_time': datetime.now(),
                 }
                 # P1-5 : Sauvegarde immédiate
                 save_open_trades(open_trades)
