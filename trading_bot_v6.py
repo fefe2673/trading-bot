@@ -580,7 +580,7 @@ def build_features(data: pd.DataFrame) -> pd.DataFrame:
         'mom10':       mom10,
         'mom20':       mom20,
         'ema_cross':   (ema9 > ema20).astype(float),
-    })
+    }, index=data.index)
     return features.replace([np.inf, -np.inf], np.nan).dropna()
 
 
