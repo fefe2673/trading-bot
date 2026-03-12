@@ -595,8 +595,8 @@ def train_model(symbol: str) -> bool:
     """
     try:
         logger.info(f"🔧 Entraînement ML {symbol}...")
-        data = get_bars(symbol, TimeFrame.Hour, 90)
-        if len(data) < 80:
+        data = get_bars(symbol, TimeFrame.Day, 365)
+        if len(data) < 60:
             logger.warning(f"{symbol} : données insuffisantes ({len(data)} bougies)")
             return False
 
@@ -606,7 +606,7 @@ def train_model(symbol: str) -> bool:
         X        = features.loc[common].iloc[:-5]
         y        = target.loc[common].iloc[:-5]
 
-        if len(X) < 40:
+        if len(X) < 30:
             logger.warning(f"{symbol} : X trop petit ({len(X)} samples après features)")
             return False
 
@@ -1043,7 +1043,7 @@ def finviz_scan() -> list:
             'Average Volume':       'Over 500K',
             'Relative Volume':      'Over 1',
             '20-Day Simple Moving Average': 'Price below SMA20',
-            'Performance':          'Down',
+            'Performance':          'Today Down',
         }
         try:
             fov_short = Overview()
