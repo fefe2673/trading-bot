@@ -752,7 +752,16 @@ def calc_size(entry_price: float, stop_price: float, size_multiplier: float = 1.
     risk_per_share = abs(entry_price - stop_price)
     if risk_per_share <= 0:
         return 2
-    return max(2, int(risk_amount / risk_per_share))
+    qty_from_risk = int(risk_amount / risk_per_share)
+
+    # CAP: limit per-position exposure to MAX_POS of capital
+    max_exposure          = account_size * MAX_POS
+    max_qty_from_exposure = int(max_exposure / entry_price)
+    qty = max(2, min(qty_from_risk, max_qty_from_exposure))
+    if qty < qty_from_risk:
+        logger.info(f"📏 Exposure cap applied: qty reduced from {qty_from_risk} to {qty} "
+                    f"(max exposure ${max_exposure:,.0f} at ${entry_price:.2f}/share)")
+    return qty
 
 
 # ============================================================
